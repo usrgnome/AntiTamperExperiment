@@ -1,22 +1,20 @@
-#include "CodeIntegrityMonitor.h"
-#include "PayloadApi.h"
-#include <cstdio>
-#include <memory>
+#include "IntegrityKernelApi.h"
 
-namespace {
-IntegrityCallback callback = nullptr;
-void OnChange(const void* address, std::size_t size, CodeIntegrityMonitor::Event event) noexcept {
-    if (callback) callback(address, size, static_cast<int>(event));
+// Copied into a separate SEC_NO_CHANGE mapping. No references to imports,
+// globals, literals or other EXE functions: the packer rejects code relocations.
+#pragma runtime_checks("", off)
+extern "C" __declspec(noinline) int CheckIntegrityChunk(const IntegrityChunkRequest* request) {
+    if (!request || !request->hashData || !request->finishHash ||
+        !request->hash || !request->bytes || !request->digest) return -1;
+    if (request->hashData(request->hash, const_cast<unsigned char*>(request->bytes),
+                          request->size, 0) < 0 ||
+        request->finishHash(request->hash, request->digest, 32, 0) < 0) return -1;
+    if (!request->baseline) return 0;
+    // Volatile reads prevent replacement with an out-of-section memcmp call.
+    const volatile unsigned char* actual = request->digest;
+    const volatile unsigned char* expected = request->baseline;
+    unsigned difference = 0;
+    for (unsigned i = 0; i < 32; ++i) difference |= actual[i] ^ expected[i];
+    return difference ? 1 : 0;
 }
-}
-extern "C" void* StartIntegrity(IntegrityCallback onChange, bool fastTest) {
-    callback = onChange;
-    auto monitor = std::make_unique<CodeIntegrityMonitor>();
-    std::printf("Original SHA-256 monitor: %zu executable bytes, %zu chunks; %s sweep target.\n",
-        monitor->byteCount(), monitor->chunkCount(), fastTest ? "100 ms test" : "20 second");
-    monitor->start(OnChange, fastTest ? std::chrono::milliseconds(100) : std::chrono::seconds(20));
-    return monitor.release();
-}
-extern "C" void StopIntegrity(void* monitor) noexcept {
-    delete static_cast<CodeIntegrityMonitor*>(monitor);
-}
+#pragma runtime_checks("", restore)

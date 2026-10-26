@@ -17,6 +17,8 @@ def place(source, destination, section_name):
         header = 20 + index * 40
         flags = struct.unpack_from('<I', data, header + 36)[0]
         if flags & 0x20000000:
+            if section_name == '.integr' and struct.unpack_from('<H', data, header + 32)[0]:
+                raise ValueError('Integrity code must be position-independent: code relocations found')
             # Retain relocations, COMDAT associations, symbols and unwind data.
             # This also moves compiler-generated worker and template code.
             data[header:header + 8] = section_name.encode().ljust(8, b'\0')

@@ -15,6 +15,8 @@ foreach(payload IN ITEMS integrity game)
     set_property(TARGET ${payload}_code PROPERTY INTERPROCEDURAL_OPTIMIZATION FALSE)
     if(payload STREQUAL "integrity")
         set(section .integr)
+        # Only the mapped kernel must avoid EXE cookie/CFG helper references.
+        target_compile_options(${payload}_code PRIVATE /GS- /guard:cf-)
     else()
         set(section .game)
     endif()
@@ -27,7 +29,7 @@ foreach(payload IN ITEMS integrity game)
         COMMAND_EXPAND_LISTS VERBATIM)
     list(APPEND mapped_objects "${mapped}")
 endforeach()
-add_executable(detour_check_linked loader.cpp ${mapped_objects})
+add_executable(detour_check_linked loader.cpp integrity_host.cpp IntegrityVeh.cpp ProtectedIntegrity.cpp ${mapped_objects})
 set_source_files_properties(${mapped_objects} PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
 target_compile_features(detour_check_linked PRIVATE cxx_std_17)
 target_compile_options(detour_check_linked PRIVATE /W4 /EHsc /Ob0 /Gy- /GL-)
@@ -44,6 +46,10 @@ add_custom_target(detour_check ALL
     DEPENDS detour_check_linked "${CMAKE_CURRENT_SOURCE_DIR}/pack_payload.py"
     BYPRODUCTS "${sealed_exe}" VERBATIM)
 enable_testing()
+add_executable(veh_integrity_tests test_veh_integrity.cpp IntegrityVeh.cpp)
+target_compile_features(veh_integrity_tests PRIVATE cxx_std_17)
+target_compile_options(veh_integrity_tests PRIVATE /W4 /EHsc)
+add_test(NAME veh_integrity_policy COMMAND veh_integrity_tests)
 add_test(NAME loader_self_test COMMAND "${sealed_exe}" --self-test)
 add_test(NAME standalone_exe COMMAND ${CMAKE_COMMAND}
     "-DEXE=${sealed_exe}" "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/standalone/$<CONFIG>"

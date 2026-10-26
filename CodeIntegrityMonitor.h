@@ -22,6 +22,7 @@
 #include <stdexcept>
 #include <thread>
 #include <vector>
+#include "IntegrityKernelApi.h"
 
 // Hashes every executable PE section in the application's EXE at startup.
 // No function registration or instrumentation is required.
@@ -45,6 +46,7 @@ public:
     // void* represents an address without specifying what type lives there.
     // noexcept means the callback promises not to throw C++ exceptions.
     using OnChange = void (*)(const void* address, std::size_t size, Event event) noexcept;
+    using OnPoll = void (*)() noexcept;
     // KiB means 1024 bytes, so each full chunk contains 65,536 code bytes.
     // A chunk is just a range of memory; it need not match function boundaries.
     static constexpr std::size_t chunkSize = 64 * 1024;
@@ -53,8 +55,11 @@ public:
     // Do this during startup, because reading/hashing all code takes time.
     // We trust the code at this moment. A hook already installed becomes part
     // of the baseline and will not be identified as a new change.
-    CodeIntegrityMonitor()
+    CodeIntegrityMonitor(IntegrityChunkCheck check, const void* mappedCode, std::size_t mappedSize)
+        : check_(check)
     {
+        if (!check || !mappedCode || !mappedSize)
+            throw std::runtime_error("Missing protected integrity kernel");
         // nullptr asks for this process's main EXE, not a DLL. Its "base" is
         // the address where Windows loaded it, which may change between runs.
         // Treating that address as unsigned char* lets us move through bytes.
@@ -95,13 +100,24 @@ public:
                 chunk.size = (std::min)(chunkSize, length - offset);
                 // SHA-256 reduces this chunk to a 32-byte fingerprint (digest).
                 // We store that fingerprint, not a copy of all the code bytes.
-                if (!hasher_.digest(chunk.address, chunk.size, chunk.original))
+                if (hasher_.check(check_, chunk.address, chunk.size, chunk.original, nullptr) != 0)
                     throw std::runtime_error("Cannot hash executable code");
                 chunks_.push_back(chunk); // Save its address, length and fingerprint.
                 bytes_ += chunk.size;
             }
         }
         if (chunks_.empty()) throw std::runtime_error("No executable sections found");
+        // The active kernel is outside the EXE. Scan its code and unwind data too.
+        const auto* mapped = static_cast<const unsigned char*>(mappedCode);
+        for (std::size_t offset = 0; offset < mappedSize; offset += chunkSize) {
+            Chunk chunk;
+            chunk.address = mapped + offset;
+            chunk.size = (std::min)(chunkSize, mappedSize - offset);
+            if (hasher_.check(check_, chunk.address, chunk.size, chunk.original, nullptr) != 0)
+                throw std::runtime_error("Cannot hash protected integrity mapping");
+            chunks_.push_back(chunk);
+            bytes_ += chunk.size;
+        }
     }
 
     // Copying an object that owns a running thread and Windows handles would
@@ -113,7 +129,7 @@ public:
     {
         // Destructor: on normal scope exit, ask the worker to stop, wake it if
         // sleeping, then wait for it to finish before releasing its resources.
-        // The loader handles Ctrl+C through normal scope exit. Forced process
+        // The game handles Ctrl+C through normal scope exit. Forced process
         // termination does not guarantee C++ destructor cleanup will run.
         {
             // A mutex allows only one thread at a time into this protected
@@ -136,7 +152,8 @@ public:
     // deadline. interval is the requested minimum spacing between scheduled wakes.
     // Defaults: aim for 20 seconds per sweep, with a 10 ms minimum interval.
     void start(OnChange onChange, std::chrono::milliseconds sweepTarget = std::chrono::seconds(20),
-               std::chrono::milliseconds interval = std::chrono::milliseconds(10))
+               std::chrono::milliseconds interval = std::chrono::milliseconds(10),
+               OnPoll onPoll = nullptr)
     {
         if (worker_.joinable() || interval.count() <= 0 || sweepTarget < interval)
             throw std::logic_error("Start once with a positive interval <= sweep target");
@@ -149,7 +166,8 @@ public:
         // This lambda (an unnamed function) runs on the new worker thread.
         // The capture list keeps the timing/callback values and a pointer to
         // this monitor. The monitor must stay alive until that thread finishes.
-        worker_ = std::thread([this, interval, slots, onChange] {
+        worker_ = std::thread([this, interval, slots, onChange, onPoll] {
+            if (onPoll) onPoll();
             std::size_t index = 0;
             std::size_t slot = 0;
             // steady_clock measures elapsed time; changing the wall clock
@@ -165,6 +183,9 @@ public:
                 // No need to hold the stop mutex during hashing or callbacks.
                 // Only this worker changes chunk state after startup.
                 lock.unlock();
+                // Drain exception observations on a normal thread, outside the
+                // VEH and outside the monitor mutex, before each hash batch.
+                if (onPoll) onPoll();
                 // Fractional distribution avoids rescanning small EXEs on
                 // every wake. Over 'slots' wakes, each chunk is checked once.
                 const auto batch = chunks_.size() / slots +
@@ -175,12 +196,14 @@ public:
                 {
                     auto& chunk = chunks_[index];
                     std::array<unsigned char, 32> digest{}; // Fixed-size local storage.
-                    if (!hasher_.digest(chunk.address, chunk.size, digest))
+                    const int result = hasher_.check(check_, chunk.address, chunk.size, digest,
+                                                     chunk.original.data());
+                    if (result != 0 && result != 1)
                     {
                         if (onChange) onChange(chunk.address, chunk.size, Event::ScanFailed);
                         return; // Leave the worker; do not silently claim code is valid.
                     }
-                    const bool modified = digest != chunk.original;
+                    const bool modified = result == 1;
                     // Report transitions, not the same warning every sweep.
                     // unchanged -> modified: alert; modified -> unchanged: restored.
                     // Another patch inside an already modified chunk is not a
@@ -237,18 +260,12 @@ private:
             BCryptDestroyHash(hash_);
             BCryptCloseAlgorithmProvider(algorithm_, 0);
         }
-        bool digest(const unsigned char* data, std::size_t size,
-                    std::array<unsigned char, 32>& output) noexcept
+        int check(IntegrityChunkCheck kernel, const unsigned char* data, std::size_t size,
+                  std::array<unsigned char, 32>& output, const unsigned char* baseline) noexcept
         {
-            // HashData reads the bytes; FinishHash writes the 32-byte result
-            // and resets this reusable hash for the next chunk.
-            // The Windows API takes a non-const pointer even though this input
-            // is read-only in use, hence const_cast. We never patch code here.
-            // ULONG is Windows' 32-bit size type; our <=64 KiB chunks fit it.
-            // && short-circuits: do not finish if feeding the bytes failed.
-            return BCryptHashData(hash_, const_cast<unsigned char*>(data),
-                                  static_cast<ULONG>(size), 0) >= 0 &&
-                   BCryptFinishHash(hash_, output.data(), static_cast<ULONG>(output.size()), 0) >= 0;
+            IntegrityChunkRequest request{hash_, &BCryptHashData, &BCryptFinishHash,
+                data, static_cast<ULONG>(size), output.data(), baseline};
+            return kernel(&request);
         }
     private:
         BCRYPT_ALG_HANDLE algorithm_ = nullptr;
@@ -264,6 +281,7 @@ private:
     };
     // Members are created before the constructor body. hasher_ is therefore
     // ready when the constructor hashes the first code chunk.
+    IntegrityChunkCheck check_;
     Hasher hasher_;
     std::vector<Chunk> chunks_;             // Growable list, filled only at startup.
     std::size_t bytes_ = 0;                 // Total code bytes, not process RAM usage.
