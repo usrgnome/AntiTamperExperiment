@@ -113,8 +113,8 @@ public:
     {
         // Destructor: on normal scope exit, ask the worker to stop, wake it if
         // sleeping, then wait for it to finish before releasing its resources.
-        // Forced process termination (including this demo's Ctrl+C exit) does
-        // not guarantee that normal C++ destructor cleanup will run.
+        // The loader handles Ctrl+C through normal scope exit. Forced process
+        // termination does not guarantee C++ destructor cleanup will run.
         {
             // A mutex allows only one thread at a time into this protected
             // part. Both threads use it when accessing stopping_.
