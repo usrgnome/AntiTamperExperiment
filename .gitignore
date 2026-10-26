@@ -1,0 +1,33 @@
+# Generated build output can be recreated; keep it out of source control.
+/build/
+/build-*/
+/cmake-build-*/
+/out/
+
+# Compiled programs, intermediate objects and Windows debug/linker files.
+*.exe
+*.obj
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.pch
+*.idb
+*.ipdb
+*.iobj
+
+# Local Visual Studio settings and Python caches.
+.vs/
+*.user
+*.suo
+__pycache__/
+*.py[cod]
+
+# CMake local configuration and accidental in-source build output.
+CMakeUserPresets.json
+/CMakeCache.txt
+/CMakeFiles/
+/cmake_install.cmake
+/CTestTestfile.cmake
+/Testing/
